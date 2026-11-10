@@ -1,0 +1,147 @@
+name: google-longform
+version: "1.0"
+description: >
+  A long narrated video built from a finished audio track. The audio is split into
+  shots, one clip is generated per shot (Google Veo 3.1, or a local ComfyUI still
+  with a Ken Burns move), every clip is fitted to the narration span it covers, and
+  the shots are joined and muxed back onto the original narration. Use this when
+  the narration already exists — a voiceover recording, a TTS render — and the
+  job is to illustrate it end to end.
+category: generated
+stability: beta
+
+default_checkpoint_policy: guided
+
+extensions:
+  custom_scripts: true
+  custom_playbooks: true
+  custom_skills: true
+  custom_tools: false
+
+required_skills:
+  - pipelines/longform/idea-director
+  - pipelines/longform/script-director
+  - pipelines/longform/scene-director
+  - pipelines/longform/asset-director
+  - pipelines/longform/compose-director
+  - meta/reviewer
+  - meta/checkpoint-protocol
+
+orchestration:
+  mode: agent-driven
+  budget_default_usd: 30.00
+  max_revisions_per_stage: 2
+  max_send_backs: 2
+  max_wall_time_minutes: 90
+
+compatible_playbooks:
+  recommended:
+    - clean-professional
+    - flat-motion-graphics
+  also_works:
+    - anime-ghibli
+  custom_allowed: true
+
+stages:
+  - name: idea
+    skill: pipelines/longform/idea-director
+    produces:
+      - brief
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "The narration source is named and its duration is known"
+      - "Visual style is stated in words a video model can act on"
+      - "Target platform and aspect ratio are decided"
+      - "Clip provider and the resulting cost are named"
+    success_criteria:
+      - Schema-valid brief with title, hook, key_points, tone, style, platform and duration
+      - Metadata records the clip provider, the narration path and the shot budget
+
+  - name: script
+    skill: pipelines/longform/script-director
+    required_artifacts_in:
+      - brief
+    produces:
+      - script
+    tools_available:
+      - transcriber
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "The narration text matches the audio that will be muxed"
+      - "Word timings cover the whole track"
+      - "No paragraph is longer than a comfortable sentence"
+    success_criteria:
+      - Schema-valid script with sections carrying start/end timings
+      - Transcript covers the full audio duration
+
+  - name: scene_plan
+    skill: pipelines/longform/scene-director
+    required_artifacts_in:
+      - script
+      - brief
+    produces:
+      - scene_plan
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "Every shot maps to a real span of the narration"
+      - "Shot lengths fit the provider's clip limit (8s for Veo at 1080p)"
+      - "Prompts describe subject, action, camera and light — not text on screen"
+      - "Visual continuity is planned: recurring subject, wardrobe, palette"
+    success_criteria:
+      - Schema-valid scene_plan with one entry per shot
+      - Shots cover the whole narration with no gaps
+
+  - name: assets
+    skill: pipelines/longform/asset-director
+    required_artifacts_in:
+      - scene_plan
+      - script
+    produces:
+      - asset_manifest
+    required_tools:
+      - longform_video
+    tools_available:
+      - longform_video
+      - veo_video
+      - comfyui_image
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "One clip per shot, each the right length"
+      - "Cost stayed within the approved budget"
+      - "Clips are visually consistent with each other"
+    success_criteria:
+      - Schema-valid asset_manifest with a clip per shot
+      - All clip files exist on disk
+
+  - name: compose
+    skill: pipelines/longform/compose-director
+    required_artifacts_in:
+      - asset_manifest
+      - scene_plan
+    produces:
+      - render_report
+      - final_review
+    required_tools:
+      - longform_video
+    tools_available:
+      - longform_video
+      - video_stitch
+      - audio_mixer
+      - subtitle_gen
+      - export_bundle
+    checkpoint_required: true
+    human_approval_default: false
+    review_focus:
+      - "Output MP4 exists and passes ffprobe validation"
+      - "Duration matches the narration track"
+      - "Narration is audible and in sync with the visuals"
+      - "No shot repeats, no frozen frame, no black section"
+    success_criteria:
+      - Schema-valid render_report with output paths, resolution, fps and duration
+      - Output file exists and passes ffprobe validation
