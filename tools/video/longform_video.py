@@ -957,10 +957,10 @@ class LongformVideo(BaseTool):
         """Join with a dissolve at every boundary — without losing time.
 
         A plain crossfade overlaps the two shots, so the picture ends up
-        shorter than the audio and the two drift apart. Here every shot except
-        the last is extended by the transition length (its last frame held),
-        and the dissolve happens over that hold. The total length is unchanged,
-        so the narration stays exactly where it was cut.
+        shorter than the audio and the two drift apart. Each merge therefore
+        holds the outgoing shot's last frame for the transition length and
+        dissolves the incoming shot over that hold, so the joined length is
+        exactly the sum of the shots.
         """
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -968,42 +968,34 @@ class LongformVideo(BaseTool):
         if len(segments) < 2:
             return self._concat(segments, dest, dest.parent)
 
-        durations = [_media_duration(s) for s in segments]
-        inputs: list[str] = []
-        for segment in segments:
-            inputs += ["-i", str(segment)]
-
-        # Each transition blends the outgoing shot's held tail with the
-        # incoming shot's head, so the picture keeps its full length while the
-        # cut reads as a dissolve. Offsets are the cumulative shot lengths.
-        steps: list[str] = []
-        offset = 0.0
-        previous = "0:v"
+        current = segments[0]
+        current_len = _media_duration(current)
+        work = dest.parent
         for index in range(1, len(segments)):
-            label = f"v{index}"
-            steps.append(
-                f"[{previous}][{index}:v]xfade=transition=fade:"
-                f"duration={crossfade:.3f}:offset={offset:.3f}[{label}]"
-            )
-            if index < len(segments) - 1:
-                steps.append(
-                    f"[{label}]tpad=stop_mode=clone:stop_duration={crossfade:.3f}[hold{index}]"
-                )
-                previous = f"hold{index}"
-            else:
-                previous = label
-            offset += durations[index - 1]
+            nxt = segments[index]
+            nxt_len = _media_duration(nxt)
+            merged = work / f"merge-{index:03d}.mp4"
+            proc = _run([
+                ffmpeg, "-y", "-i", str(current), "-i", str(nxt),
+                "-filter_complex",
+                f"[0:v]tpad=stop_mode=clone:stop_duration={crossfade:.3f}[hold];"
+                f"[hold][1:v]xfade=transition=fade:duration={crossfade:.3f}:"
+                f"offset={current_len:.3f}[v]",
+                "-map", "[v]", "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-r", str(fps), str(merged),
+            ], timeout=1800)
+            if proc.returncode != 0:
+                return False, f"ffmpeg dissolve failed: {(proc.stderr or '')[-300:]}"
+            current = merged
+            current_len += nxt_len
+            try:
+                merged.unlink()
+            except OSError:
+                pass
 
-        proc = _run(
-            [ffmpeg, "-y"] + inputs
-            + ["-filter_complex", ";".join(steps), "-map", f"[{previous}]",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-               "-pix_fmt", "yuv420p", "-r", str(fps), "-an", str(dest)],
-            timeout=1800,
-        )
-        if proc.returncode != 0:
-            return False, f"ffmpeg xfade failed: {(proc.stderr or '')[-300:]}"
-        expected = sum(durations)
+        shutil.move(str(current), str(dest))
+        expected = sum(_media_duration(s) for s in segments)
         actual = _media_duration(dest)
         if expected > 0 and abs(actual - expected) > 0.5:
             return False, (
