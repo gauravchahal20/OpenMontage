@@ -18,6 +18,13 @@ from typing import Any, Callable
 import requests
 
 
+# ComfyUI model inventory per server URL -> (fetched_at, models).
+# Shared by every ComfyUI-backed tool so a preflight sweep pays for the
+# `/object_info` round trips once instead of once per tool.
+_MODEL_LIST_CACHE: dict[str, tuple[float, dict[str, list[str]]]] = {}
+_MODEL_LIST_TTL_SECONDS = 60.0
+
+
 class ComfyUIError(Exception):
     """Raised when ComfyUI returns an error or times out.
 
@@ -178,7 +185,7 @@ class ComfyUIClient:
     # Model discovery
     # ------------------------------------------------------------------
 
-    def list_models(self) -> dict[str, list[str]]:
+    def list_models(self, *, refresh: bool = False) -> dict[str, list[str]]:
         """Query ComfyUI for available models, grouped by type.
 
         Returns a dict like::
@@ -190,7 +197,18 @@ class ComfyUIClient:
                 "clip": ["clip_l.safetensors", ...],
                 "loras": ["my_lora.safetensors", ...],
             }
+
+        Results are cached per server URL for ``_MODEL_LIST_TTL_SECONDS``.
+        The lookup costs four ``/object_info`` round trips, and every
+        ComfyUI-backed tool asks for it during ``get_status()`` — without the
+        cache, a single preflight sweep spends minutes re-fetching the same
+        answers. Pass ``refresh=True`` to force a re-fetch (e.g. right after
+        downloading a checkpoint).
         """
+        cached = _MODEL_LIST_CACHE.get(self.server_url)
+        if cached and not refresh and (time.time() - cached[0]) < _MODEL_LIST_TTL_SECONDS:
+            return {group: list(names) for group, names in cached[1].items()}
+
         node_to_key = {
             "CheckpointLoaderSimple": ("ckpt_name", "checkpoints"),
             "UNETLoader": ("unet_name", "diffusion_models"),
@@ -216,6 +234,7 @@ class ComfyUIClient:
                     result[group] = options
             except Exception:
                 result[group] = []
+        _MODEL_LIST_CACHE[self.server_url] = (time.time(), result)
         return result
 
     def check_models(self, required: list[str]) -> tuple[list[str], list[str]]:

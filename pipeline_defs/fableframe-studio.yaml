@@ -1,0 +1,128 @@
+name: fableframe-studio
+version: "1.0"
+description: >
+  Narrated explainer or story short produced end to end on one machine: OmniVoice
+  synthesises the narration from a local GPU, Fableframe transcribes it, directs
+  the scenes with a multi-agent AI director, paints the visual plates through
+  ComfyUI, and renders the finished MP4 with Remotion. OpenMontage owns the run
+  ledger, the checkpoints, the review gates and the Backlot board.
+category: generated
+stability: beta
+
+default_checkpoint_policy: guided
+
+extensions:
+  custom_scripts: true
+  custom_playbooks: true
+  custom_skills: true
+  custom_tools: false
+
+required_skills:
+  - pipelines/fableframe-studio/idea-director
+  - pipelines/fableframe-studio/script-director
+  - pipelines/fableframe-studio/asset-director
+  - pipelines/fableframe-studio/compose-director
+  - meta/reviewer
+  - meta/checkpoint-protocol
+
+orchestration:
+  mode: agent-driven
+  budget_default_usd: 0.00
+  max_revisions_per_stage: 2
+  max_send_backs: 2
+  max_wall_time_minutes: 45
+
+compatible_playbooks:
+  recommended:
+    - flat-motion-graphics
+    - clean-professional
+  also_works:
+    - anime-ghibli
+  custom_allowed: true
+
+stages:
+  - name: idea
+    skill: pipelines/fableframe-studio/idea-director
+    produces:
+      - brief
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "One clear hook that states the promise of the video"
+      - "Target duration matches the narration budget (roughly 2.5 words per second)"
+      - "Narration language and voice attributes are stated explicitly"
+      - "Topic is specific enough that a script can be written without further research"
+    success_criteria:
+      - Schema-valid brief with title, hook, key_points, tone, style, platform and duration
+      - Narration language and voice attributes recorded in metadata
+
+  - name: script
+    skill: pipelines/fableframe-studio/script-director
+    required_artifacts_in:
+      - brief
+    produces:
+      - script
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "Word count within +/-10% of the brief's duration target"
+      - "Every key point from the brief is covered exactly once"
+      - "Spoken text reads naturally aloud in the target language"
+      - "Voice attributes are assigned per line when the piece has more than one speaker"
+    success_criteria:
+      - Schema-valid script with sections carrying start/end timings
+      - Total duration matches the brief target within 10%
+
+  - name: assets
+    skill: pipelines/fableframe-studio/asset-director
+    required_artifacts_in:
+      - script
+      - brief
+    produces:
+      - asset_manifest
+    required_tools:
+      - omnivoice_tts
+    tools_available:
+      - omnivoice_tts
+      - piper_tts
+      - music_gen
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - "Narration audio exists and covers every script section"
+      - "Audio language matches the script language"
+      - "Voice matches the approved attributes (listen to the sample)"
+      - "Total cost within the approved budget (this pipeline runs at zero cost)"
+    success_criteria:
+      - Schema-valid asset_manifest with a narration asset per script section
+      - All file paths resolve to existing files
+
+  - name: compose
+    skill: pipelines/fableframe-studio/compose-director
+    required_artifacts_in:
+      - asset_manifest
+      - script
+    optional_artifacts_in:
+      - brief
+    produces:
+      - render_report
+      - final_review
+    required_tools:
+      - fableframe_render
+    tools_available:
+      - fableframe_render
+      - video_compose
+      - hyperframes_compose
+      - export_bundle
+    checkpoint_required: true
+    human_approval_default: false
+    review_focus:
+      - "Output MP4 exists in renders/ and passes ffprobe validation"
+      - "Duration within +/-5% of the script duration"
+      - "Narration audio is present and in sync with the visuals"
+      - "Visual plates are distinct across scenes (no repeated image)"
+    success_criteria:
+      - Schema-valid render_report with output paths, resolution, fps and duration
+      - Output file exists and passes ffprobe validation
