@@ -81,6 +81,36 @@ original narration on top.
 
 **Your audio is the audio that ships.** The tool never regenerates the voice.
 
+### Mixing rendering methods in one video
+
+A shot may name its own `method`, so one video can mix engines — Flow for the
+cinematic beats, ComfyUI stills for the establishing shots, Fableframe for a
+fully animated section:
+
+```python
+result = registry.get("longform_video").execute({
+    "audio_path": "<project>/assets/audio/narration.wav",
+    "output_path": "<project>/renders/final.mp4",
+    "provider": "still",
+    "shots": [
+        {"id": "a", "method": "fableframe", "start_seconds": 0, "end_seconds": 16,
+         "duration": 16, "prompt": "...", "caption_script": "none"},
+        {"id": "b", "method": "still", "start_seconds": 16, "end_seconds": 34,
+         "duration": 18, "prompt": "..."},
+    ],
+})
+```
+
+Two things to know before you mix:
+
+- **Different methods mean different visual languages.** A Fableframe section
+  carries its own camera work, characters and plates; a ComfyUI still section is
+  a painted frame with a slow move. The cut between them is visible. Mix methods
+  deliberately — a montage, a flashback, a "different take" — not by accident.
+- **One caption treatment.** Give the Fableframe section `"caption_script":
+  "none"` and let the tool burn one caption track over the whole film, or the
+  two styles end up stacked on top of each other.
+
 ### 4. Check the result before checkpointing
 
 - `clips` — one entry per shot, each with its span.

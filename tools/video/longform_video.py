@@ -31,6 +31,7 @@ runtime. A 60-second video needs ~8 clips of 8s = 64 generated seconds
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -227,6 +228,24 @@ class LongformVideo(BaseTool):
                         "narration": {"type": "string"},
                         "start_seconds": {"type": "number"},
                         "end_seconds": {"type": "number"},
+                        "method": {
+                            "type": "string",
+                            "enum": ["veo", "flow", "still", "fableframe", "mock"],
+                            "description": (
+                                "Rendering method for this shot only. Lets one video mix "
+                                "engines: Flow clips for the cinematic beats, ComfyUI stills "
+                                "for the establishing shots, Fableframe for a fully animated "
+                                "section. Defaults to the tool-level `provider`."
+                            ),
+                        },
+                        "audio_path": {
+                            "type": "string",
+                            "description": (
+                                "Optional audio for this shot only — a differently voiced "
+                                "section, for example. The track is cut on the same "
+                                "boundaries as the picture."
+                            ),
+                        },
                     },
                 },
             },
@@ -541,6 +560,114 @@ class LongformVideo(BaseTool):
     # Clip generation
     # ------------------------------------------------------------------
 
+    def _generate_fableframe_clip(
+        self,
+        shot: dict,
+        dest: Path,
+        work: Path,
+        index: int,
+        audio_slice: Path | None,
+        style: str = "",
+    ) -> tuple[bool, str]:
+        """One section rendered end to end by Fableframe.
+
+        Fableframe owns a whole rendering method: it transcribes the narration,
+        directs the scenes with a multi-agent AI director, paints visual plates
+        through ComfyUI and composites the episode in Remotion. Feeding it one
+        section of the narration gives that section its own look — animated SVG
+        and painted plates — next to the clips other sections were made with.
+        """
+        from tools.tool_registry import registry
+
+        registry.discover()
+        tool = registry.get("fableframe_render")
+        if tool is None:
+            return False, "fableframe_render tool is not registered"
+        if audio_slice is None or not audio_slice.is_file():
+            return False, "fableframe needs the section's audio slice"
+
+        # The project name carries a fingerprint of the options, so changing
+        # the caption script or the mode never reuses a cached render.
+        fingerprint = hashlib.sha256(
+            json.dumps({
+                "caption_script": shot.get("caption_script") or "native",
+                "mode": shot.get("mode") or "auto",
+                "style": style,
+            }, sort_keys=True).encode()
+        ).hexdigest()[:8]
+        project_name = f"hybrid-{index:02d}-{shot.get('id', 'shot')}-{fingerprint}"
+        result = tool.execute({
+            "audio_path": str(audio_slice),
+            "project_name": project_name,
+            "output_path": str(dest),
+            "mode": shot.get("mode") or "auto",
+            "caption_script": shot.get("caption_script") or "native",
+            "force": bool(shot.get("force")),
+        })
+        if not result.success:
+            return False, result.error or "fableframe render failed"
+        return True, ""
+
+    def _slice_audio(self, audio: Path, start: float, duration: float, dest: Path) -> Path | None:
+        """Cut a section out of the narration track."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        proc = _run([
+            ffmpeg, "-y", "-ss", f"{start:.3f}", "-i", str(audio),
+            "-t", f"{duration:.3f}", "-c:a", "pcm_s16le", str(dest),
+        ], timeout=300)
+        if proc.returncode != 0 or not dest.is_file():
+            return None
+        return dest
+
+    def _build_audio_track(
+        self,
+        shots: list[dict],
+        global_audio: Path,
+        work: Path,
+    ) -> tuple[Path | None, str]:
+        """Assemble one audio track from the shots.
+
+        Each shot contributes its own audio when it has one (a differently
+        voiced section), otherwise the matching slice of the global narration.
+        The result is muxed onto the joined video, so the picture and the sound
+        are cut on the same boundaries.
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return None, "ffmpeg not found"
+        parts: list[Path] = []
+        for index, shot in enumerate(shots):
+            start = float(shot.get("start_seconds") or 0.0)
+            span = float(shot.get("duration") or 0.0)
+            if span <= 0.05:
+                continue
+            own = shot.get("audio_path")
+            if own and Path(own).is_file():
+                parts.append(Path(own))
+                continue
+            slice_path = work / "audio" / f"{index:03d}.wav"
+            slice_path.parent.mkdir(parents=True, exist_ok=True)
+            sliced = self._slice_audio(global_audio, start, span, slice_path)
+            if sliced is not None:
+                parts.append(sliced)
+        if not parts:
+            return None, "no audio could be assembled"
+        listing = work / "audio-concat.txt"
+        listing.write_text(
+            "\n".join(f"file '{p.resolve().as_posix()}'" for p in parts), encoding="utf-8"
+        )
+        mixed = work / "audio-track.wav"
+        proc = _run([
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
+            "-c:a", "pcm_s16le", str(mixed),
+        ], timeout=900)
+        if proc.returncode != 0:
+            return None, f"ffmpeg audio concat failed: {(proc.stderr or '')[-200:]}"
+        return mixed, ""
+
     def _generate_veo_clip(
         self,
         shot: dict,
@@ -706,10 +833,14 @@ class LongformVideo(BaseTool):
             if not ffmpeg:
                 return False, "ffmpeg not found", None
             frames = max(1, int(round(duration * fps)))
-            zoom = "min(zoom+0.0009,1.35)" if duration <= 9 else "min(zoom+0.0006,1.25)"
+            # The Ken Burns move is scaled to the shot length, so a 3-second shot
+            # travels as far as a 9-second one instead of sitting almost still.
+            travel = 0.22 if duration <= 9 else 0.16
+            rate = travel / max(frames, 1)
             vf = (
                 f"scale={width * 2}:{height * 2}:flags=lanczos,"
-                f"zoompan=z='{zoom}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                f"zoompan=z='min(zoom+{rate:.6f},1.0+{travel:.2f})'"
+                f":d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
                 f":s={width}x{height}:fps={fps},"
                 "format=yuv420p"
             )
@@ -722,6 +853,34 @@ class LongformVideo(BaseTool):
             if proc.returncode != 0:
                 return False, f"ffmpeg failed: {(proc.stderr or '')[-300:]}", None
         return True, "", kept
+
+    def _generate_slate_clip(
+        self,
+        dest: Path,
+        duration: float,
+        resolution: str,
+        fps: int,
+        label: str = "",
+    ) -> tuple[bool, str]:
+        """A neutral slate for a shot that could not be generated.
+
+        Dropping a failed shot would shorten the video and desynchronise it
+        from the narration. A slate of the same length keeps the cut honest:
+        the hole is visible and in the right place.
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return False, "ffmpeg not found"
+        width, height = (1280, 720) if resolution == "1080p" else (960, 540)
+        proc = _run([
+            ffmpeg, "-y", "-f", "lavfi", "-i",
+            f"color=c=0x111418:s={width}x{height}:r={fps}:d={duration:.3f}",
+            "-vf", "format=yuv420p", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "28", "-t", f"{duration:.3f}", str(dest),
+        ], timeout=300)
+        if proc.returncode != 0:
+            return False, f"ffmpeg slate failed: {(proc.stderr or '')[-200:]}"
+        return True, ""
 
     def _generate_mock_clip(
         self, shot: dict, dest: Path, duration: float, resolution: str, fps: int
@@ -744,8 +903,17 @@ class LongformVideo(BaseTool):
     # Assembly
     # ------------------------------------------------------------------
 
-    def _fit_clip(self, clip: Path, dest: Path, span: float, fps: int) -> tuple[bool, str]:
-        """Trim, slow or freeze-pad a clip so it exactly covers `span` seconds."""
+    def _fit_clip(
+        self, clip: Path, dest: Path, span: float, fps: int, resolution: str = "1080p"
+    ) -> tuple[bool, str]:
+        """Trim, slow or freeze-pad a clip so it exactly covers `span` seconds.
+
+        Every segment is re-encoded to the same codec, size, frame rate and
+        pixel format, and stripped of its audio. The narration is muxed back on
+        top at the end, and the join needs every segment to have the same
+        stream layout — a clip that arrived with its own audio (Fableframe's
+        renders do) would otherwise truncate the concatenation.
+        """
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return False, "ffmpeg not found"
@@ -753,38 +921,103 @@ class LongformVideo(BaseTool):
         if clip_len <= 0:
             return False, f"clip has no readable duration: {clip}"
 
+        width, height = (1280, 720) if resolution == "1080p" else (960, 540)
+        common = [
+            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=disable,format=yuv420p",
+            "-r", str(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-an", str(dest),
+        ]
+
         if abs(clip_len - span) < 0.05:
-            proc = _run([ffmpeg, "-y", "-i", str(clip), "-c", "copy", str(dest)], timeout=300)
+            proc = _run([ffmpeg, "-y", "-i", str(clip)] + common, timeout=600)
         elif clip_len > span:
             proc = _run([
                 ffmpeg, "-y", "-i", str(clip), "-t", f"{span:.3f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                "-pix_fmt", "yuv420p", "-r", str(fps), "-an", str(dest),
-            ], timeout=600)
+            ] + common, timeout=900)
         else:
             # Too short: slow it down if that stays natural (max 1.6x), then
             # freeze the last frame for whatever is left.
             speed = clip_len / span
             if speed >= 0.62:
                 vf = f"setpts=PTS/{max(speed, 0.01):.4f},tpad=stop_mode=clone:stop_duration={span:.3f}"
-                proc = _run([
-                    ffmpeg, "-y", "-i", str(clip), "-vf", vf,
-                    "-t", f"{span:.3f}", "-c:v", "libx264", "-preset", "veryfast",
-                    "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(fps), "-an", str(dest),
-                ], timeout=900)
             else:
                 vf = f"setpts={span / clip_len:.4f}*PTS,tpad=stop_mode=clone:stop_duration={span:.3f}"
-                proc = _run([
-                    ffmpeg, "-y", "-i", str(clip), "-vf", vf,
-                    "-t", f"{span:.3f}", "-c:v", "libx264", "-preset", "veryfast",
-                    "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(fps), "-an", str(dest),
-                ], timeout=900)
+            proc = _run([
+                ffmpeg, "-y", "-i", str(clip), "-t", f"{span:.3f}",
+                "-vf", vf,
+            ] + common, timeout=900)
 
         if proc.returncode != 0:
             return False, f"ffmpeg fit failed: {(proc.stderr or '')[-300:]}"
         return True, ""
 
+    def _concat_xfade(
+        self, segments: list[Path], dest: Path, crossfade: float, fps: int
+    ) -> tuple[bool, str]:
+        """Join with a dissolve at every boundary — without losing time.
+
+        A plain crossfade overlaps the two shots, so the picture ends up
+        shorter than the audio and the two drift apart. Here every shot except
+        the last is extended by the transition length (its last frame held),
+        and the dissolve happens over that hold. The total length is unchanged,
+        so the narration stays exactly where it was cut.
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return False, "ffmpeg not found"
+        if len(segments) < 2:
+            return self._concat(segments, dest, dest.parent)
+
+        durations = [_media_duration(s) for s in segments]
+        inputs: list[str] = []
+        for segment in segments:
+            inputs += ["-i", str(segment)]
+
+        # Each transition blends the outgoing shot's held tail with the
+        # incoming shot's head, so the picture keeps its full length while the
+        # cut reads as a dissolve. Offsets are the cumulative shot lengths.
+        steps: list[str] = []
+        offset = 0.0
+        previous = "0:v"
+        for index in range(1, len(segments)):
+            label = f"v{index}"
+            steps.append(
+                f"[{previous}][{index}:v]xfade=transition=fade:"
+                f"duration={crossfade:.3f}:offset={offset:.3f}[{label}]"
+            )
+            if index < len(segments) - 1:
+                steps.append(
+                    f"[{label}]tpad=stop_mode=clone:stop_duration={crossfade:.3f}[hold{index}]"
+                )
+                previous = f"hold{index}"
+            else:
+                previous = label
+            offset += durations[index - 1]
+
+        proc = _run(
+            [ffmpeg, "-y"] + inputs
+            + ["-filter_complex", ";".join(steps), "-map", f"[{previous}]",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+               "-pix_fmt", "yuv420p", "-r", str(fps), "-an", str(dest)],
+            timeout=1800,
+        )
+        if proc.returncode != 0:
+            return False, f"ffmpeg xfade failed: {(proc.stderr or '')[-300:]}"
+        expected = sum(durations)
+        actual = _media_duration(dest)
+        if expected > 0 and abs(actual - expected) > 0.5:
+            return False, (
+                f"the dissolve join is {actual:.2f}s but the shots total {expected:.2f}s"
+            )
+        return True, ""
+
     def _concat(self, segments: list[Path], dest: Path, work: Path) -> tuple[bool, str]:
+        """Join the segments, then check the result really is the sum of them.
+
+        The concat demuxer quietly stops at the first file whose stream layout
+        differs, so the join is verified against the expected length instead of
+        being assumed.
+        """
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             return False, "ffmpeg not found"
@@ -799,9 +1032,42 @@ class LongformVideo(BaseTool):
         ], timeout=1800)
         if proc.returncode != 0:
             return False, f"ffmpeg concat failed: {(proc.stderr or '')[-300:]}"
+
+        expected = sum(_media_duration(s) for s in segments)
+        actual = _media_duration(dest)
+        if expected > 0 and actual < expected - 0.5:
+            # The demuxer truncated: fall back to the filter-based join, which
+            # re-encodes and tolerates differing parameters.
+            inputs: list[str] = []
+            for segment in segments:
+                inputs += ["-i", str(segment)]
+            chain = "".join(f"[{i}:v]" for i in range(len(segments)))
+            filter_complex = (
+                f"{chain}concat=n={len(segments)}:v=1:a=0[outv]"
+            )
+            proc = _run(
+                [ffmpeg, "-y"] + inputs
+                + ["-filter_complex", filter_complex, "-map", "[outv]",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                   "-pix_fmt", "yuv420p", "-an", str(dest)],
+                timeout=1800,
+            )
+            if proc.returncode != 0:
+                return False, f"ffmpeg concat (filter) failed: {(proc.stderr or '')[-300:]}"
+            actual = _media_duration(dest)
+            if actual < expected - 0.5:
+                return False, (
+                    f"the join is {actual:.2f}s but the segments total {expected:.2f}s"
+                )
         return True, ""
 
     def _write_srt(self, words: list[dict], path: Path) -> bool:
+        """Write readable captions from word timings.
+
+        One subtitle per word flickers and cannot be read. Words are grouped
+        into short lines — a sentence end, a pause, or roughly a dozen words —
+        so the caption reads like a subtitle, not a teleprompter.
+        """
         if not words:
             return False
 
@@ -812,16 +1078,47 @@ class LongformVideo(BaseTool):
             millis = int(round((seconds - int(seconds)) * 1000))
             return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{millis:03d}"
 
+        max_words = 12
+        max_seconds = 4.0
+        min_seconds = 0.8
+        gap_break = 0.45
+
         lines: list[str] = []
         index = 1
+        group: list[dict] = []
+
+        def flush() -> None:
+            nonlocal group, index
+            if not group:
+                return
+            text = " ".join(str(w.get("word") or "") for w in group).strip()
+            start = float(group[0].get("start") or 0.0)
+            end = float(group[-1].get("end") or start)
+            if text:
+                lines.append(f"{index}\n{stamp(start)} --> {stamp(end)}\n{text}\n")
+                index += 1
+            group = []
+
         for word in words:
             text = str(word.get("word") or "").strip()
             if not text:
                 continue
-            start = float(word.get("start") or 0.0)
-            end = float(word.get("end") or start)
-            lines.append(f"{index}\n{stamp(start)} --> {stamp(end)}\n{text}\n")
-            index += 1
+            if group:
+                previous_end = float(group[-1].get("end") or 0.0)
+                start = float(word.get("start") or 0.0)
+                span = float(word.get("end") or start) - float(group[0].get("start") or 0.0)
+                if (
+                    len(group) >= max_words
+                    or span > max_seconds
+                    or (start - previous_end) > gap_break
+                    or text[-1] in ".!?।"
+                ):
+                    flush()
+            group.append(word)
+        flush()
+
+        if not lines:
+            return False
         path.write_text("\n".join(lines), encoding="utf-8")
         return True
 
@@ -944,9 +1241,12 @@ class LongformVideo(BaseTool):
                 continue
             raw_clip = clips_dir / f"{shot.get('id', f'shot{index:02d}')}-raw.mp4"
             segment = clips_dir / f"{shot.get('id', f'shot{index:02d}')}-seg.mp4"
+            # A shot may name its own rendering method, so different sections of
+            # the same video can be made by different engines.
+            method = str(shot.get("method") or provider).lower()
 
             ok, error = False, ""
-            if provider == "veo":
+            if method == "veo":
                 # Flow-style continuity: a fixed reference (Scenes) or the
                 # previous shot's last frame (chained frames).
                 first_frame = None
@@ -959,7 +1259,7 @@ class LongformVideo(BaseTool):
                     first_frame=first_frame, reference_images=refs,
                 )
                 total_cost += cost
-            elif provider == "still":
+            elif method == "still":
                 source = None
                 if continuity == "reference" and reference_images:
                     source = Path(reference_images[0])
@@ -971,7 +1271,7 @@ class LongformVideo(BaseTool):
                 )
                 if ok and still is not None:
                     previous_still = still
-            elif provider == "flow":
+            elif method == "flow":
                 # Flow is the web surface: ingredients keep the subject
                 # consistent, and the previous shot's frame continues the scene.
                 refs = list(reference_images)
@@ -980,19 +1280,55 @@ class LongformVideo(BaseTool):
                 ok, error = self._generate_flow_clip(
                     shot, raw_clip, style, resolution, reference_images=refs
                 )
+            elif method == "fableframe":
+                slice_path = self._slice_audio(
+                    audio_path,
+                    float(shot.get("start_seconds") or 0.0),
+                    span,
+                    work / "audio" / f"{index:03d}-section.wav",
+                )
+                ok, error = self._generate_fableframe_clip(
+                    shot, raw_clip, work, index, slice_path, style
+                )
             else:
                 ok, error = self._generate_mock_clip(shot, raw_clip, span, resolution, fps)
 
             if not ok:
                 failures.append(f"{shot.get('id')}: {error}")
+                # Keep the section's length so the narration stays in sync; the
+                # hole is shown as a slate instead of silently vanishing.
+                slate = clips_dir / f"{shot.get('id', f'shot{index:02d}')}-slate.mp4"
+                slate_ok, slate_error = self._generate_slate_clip(
+                    slate, span, resolution, fps, label=str(shot.get("id"))
+                )
+                if not slate_ok:
+                    failures[-1] += f" (and the placeholder failed: {slate_error})"
+                    continue
+                raw_clip = slate
+                segment = clips_dir / f"{shot.get('id', f'shot{index:02d}')}-seg.mp4"
+                fitted, fit_error = self._fit_clip(raw_clip, segment, span, fps, resolution)
+                if not fitted:
+                    failures[-1] += f" (placeholder not fitted: {fit_error})"
+                    continue
+                segments.append(segment)
+                clip_records.append({
+                    "id": shot.get("id"),
+                    "start_seconds": shot.get("start_seconds"),
+                    "end_seconds": shot.get("end_seconds"),
+                    "duration_seconds": round(span, 3),
+                    "narration": shot.get("narration"),
+                    "prompt": shot.get("prompt"),
+                    "clip": str(raw_clip),
+                    "placeholder": True,
+                })
                 continue
 
-            if continuity == "chain" and provider in {"veo", "flow"}:
+            if continuity == "chain" and method in {"veo", "flow"}:
                 frame = self._extract_last_frame(raw_clip, work / "frames" / f"{index:03d}.png")
                 if frame is not None:
                     previous_frame = frame
 
-            fitted, fit_error = self._fit_clip(raw_clip, segment, span, fps)
+            fitted, fit_error = self._fit_clip(raw_clip, segment, span, fps, resolution)
             if not fitted:
                 failures.append(f"{shot.get('id')}: {fit_error}")
                 continue
@@ -1015,7 +1351,10 @@ class LongformVideo(BaseTool):
             )
 
         silent = work / "joined.mp4"
-        ok, error = self._concat(segments, silent, work)
+        if crossfade > 0.05:
+            ok, error = self._concat_xfade(segments, silent, crossfade, fps)
+        else:
+            ok, error = self._concat(segments, silent, work)
         if not ok:
             return ToolResult(success=False, error=error)
 
@@ -1025,7 +1364,15 @@ class LongformVideo(BaseTool):
             if self._write_srt(words, srt_path):
                 srt_file = srt_path
 
-        ok, error = self._mux(silent, audio_path, output_path, srt_file, fps)
+        # The audio track is cut on the same boundaries as the picture: a shot
+        # with its own audio contributes that, everything else takes its slice
+        # of the global narration.
+        mixed_audio, audio_error = self._build_audio_track(shots, audio_path, work)
+        if mixed_audio is None:
+            mixed_audio = audio_path
+            audio_error = audio_error or "using the original narration track"
+
+        ok, error = self._mux(silent, mixed_audio, output_path, srt_file, fps)
         if not ok:
             return ToolResult(success=False, error=error)
 
@@ -1040,6 +1387,10 @@ class LongformVideo(BaseTool):
             "clips": clip_records,
             "failed_shots": failures,
             "subtitles_burned": bool(srt_file),
+            "audio_track": str(mixed_audio),
+            "audio_note": audio_error,
+            "methods": sorted({str(s.get("method") or provider) for s in shots}),
+            "complete": not failures,
             "cost_usd": round(total_cost, 4),
             "work_dir": str(work),
         }

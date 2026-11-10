@@ -54,9 +54,19 @@ you need if a single shot has to be regenerated.
 
 ### 3. Verify the file, then watch it
 
-Probe first: resolution, fps, **both** streams (video + audio), and a duration
-that matches the narration track. Then watch it, because the probe cannot see
-these four failures:
+Run the checker first — it measures what a render log cannot:
+
+```bash
+.venv\\Scripts\\python.exe scripts\\quality_check_video.py renders\\final.mp4 \
+    --narration assets\\audio\\narration.wav --out renders\\final.quality.md
+```
+
+It reports the streams, the duration against the narration, the audio level, black
+frames, repeated frames and the amount of motion between frames, and scores the
+result out of 10. It exits non-zero below `--min-score` (default 7), so it can
+gate the stage.
+
+Then watch it, because the checker cannot see these four failures:
 
 1. **A frozen frame** — a clip shorter than its span was freeze-padded instead
    of slowed. Visible as a still image held for seconds.
