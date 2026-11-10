@@ -987,12 +987,15 @@ class LongformVideo(BaseTool):
             ], timeout=1800)
             if proc.returncode != 0:
                 return False, f"ffmpeg dissolve failed: {(proc.stderr or '')[-300:]}"
+            # The previous intermediate is no longer needed — but only after
+            # the merge has read it.
+            if current != segments[0]:
+                try:
+                    current.unlink()
+                except OSError:
+                    pass
             current = merged
             current_len += nxt_len
-            try:
-                merged.unlink()
-            except OSError:
-                pass
 
         shutil.move(str(current), str(dest))
         expected = sum(_media_duration(s) for s in segments)

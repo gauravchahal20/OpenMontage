@@ -204,6 +204,8 @@ class FableframeRender(BaseTool):
         ]
         if inputs.get("force"):
             command.append("--force")
+        if inputs.get("skip_transcribe"):
+            command.append("--skip-transcribe")
 
         started = time.time()
         try:
