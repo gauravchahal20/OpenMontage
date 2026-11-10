@@ -31,6 +31,17 @@ Tool: longform_video | Provider: local still (ComfyUI SD 1.5 + Ken Burns)
 Cost: $0.00 | Runtime: ~3 minutes on the RTX 3050
 ```
 
+Or, for the Google Flow web surface (no API key — it drives the signed-in browser,
+and the clip comes out of the user's Flow subscription):
+
+```
+Tool: longform_video | Provider: Google Flow web surface (flow_browser)
+Cost: $0.00 (uses the Flow subscription) | Runtime: ~10 minutes, browser visible
+```
+
+The Flow route needs a signed-in session: run `flow_browser` with
+`operation: "login"` once before the first generation.
+
 ### 2. Dry-run first
 
 Always plan before generating:

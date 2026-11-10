@@ -202,12 +202,14 @@ class LongformVideo(BaseTool):
             "output_path": {"type": "string", "description": "Where to write the finished MP4."},
             "provider": {
                 "type": "string",
-                "enum": ["veo", "still", "mock"],
+                "enum": ["veo", "flow", "still", "mock"],
                 "default": "veo",
                 "description": (
-                    "Where each shot's clip comes from. `veo` = Google Veo 3.1 (real motion, "
-                    "costs money). `still` = one ComfyUI image per shot with a Ken Burns move "
-                    "(free, local). `mock` = flat colour clips (wiring test)."
+                    "Where each shot's clip comes from. `veo` = Google Veo 3.1 through the "
+                    "Gemini API (real motion, costs money per generated second). `flow` = the "
+                    "Google Flow web surface driven in your signed-in Chrome (no API key, "
+                    "uses your Flow subscription). `still` = one ComfyUI image per shot with "
+                    "a Ken Burns move (free, local). `mock` = flat colour clips (wiring test)."
                 ),
             },
             "shots": {
@@ -326,6 +328,7 @@ class LongformVideo(BaseTool):
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         provider = str(inputs.get("provider", "veo")).lower()
         if provider != "veo":
+            # Flow runs on a subscription; the local providers are free.
             return 0.0
         seconds = float(inputs.get("total_seconds") or 0.0)
         if seconds <= 0:
@@ -584,6 +587,41 @@ class LongformVideo(BaseTool):
             return False, result.error or "veo generation failed", 0.0
         cost = float(result.cost_usd or 0.0)
         return True, "", cost
+
+    def _generate_flow_clip(
+        self,
+        shot: dict,
+        dest: Path,
+        style: str,
+        resolution: str,
+        reference_images: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        """One clip from the Google Flow web surface.
+
+        Flow has no API, so this drives the real page through the
+        ``flow_browser`` tool. Reference images are Flow's ingredients: a
+        character sheet keeps the same subject across shots.
+        """
+        from tools.tool_registry import registry
+
+        registry.discover()
+        tool = registry.get("flow_browser")
+        if tool is None:
+            return False, "flow_browser tool is not registered"
+        prompt = f"{style}. {shot.get('prompt')}".strip(". ")
+        result = tool.execute({
+            "operation": "generate",
+            "prompt": prompt,
+            "reference_image_paths": list(reference_images or []),
+            "output_path": str(dest),
+            "aspect": "16:9",
+            "resolution": resolution,
+            "duration_seconds": 8,
+            "headless": False,
+        })
+        if not result.success:
+            return False, result.error or "Flow generation failed"
+        return True, ""
 
     def _extract_last_frame(self, clip: Path, dest: Path) -> Path | None:
         """Grab the final frame of a clip, so the next shot can continue from it."""
@@ -933,6 +971,15 @@ class LongformVideo(BaseTool):
                 )
                 if ok and still is not None:
                     previous_still = still
+            elif provider == "flow":
+                # Flow is the web surface: ingredients keep the subject
+                # consistent, and the previous shot's frame continues the scene.
+                refs = list(reference_images)
+                if continuity == "chain" and previous_frame and previous_frame.is_file():
+                    refs = [str(previous_frame)]
+                ok, error = self._generate_flow_clip(
+                    shot, raw_clip, style, resolution, reference_images=refs
+                )
             else:
                 ok, error = self._generate_mock_clip(shot, raw_clip, span, resolution, fps)
 
@@ -940,7 +987,7 @@ class LongformVideo(BaseTool):
                 failures.append(f"{shot.get('id')}: {error}")
                 continue
 
-            if continuity == "chain" and provider == "veo":
+            if continuity == "chain" and provider in {"veo", "flow"}:
                 frame = self._extract_last_frame(raw_clip, work / "frames" / f"{index:03d}.png")
                 if frame is not None:
                     previous_frame = frame

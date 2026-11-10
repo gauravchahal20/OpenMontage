@@ -1,0 +1,84 @@
+{
+  "_comment": "Selector map for the Google Flow web surface. Google ships UI changes without notice, so every step is resolved by trying several strategies in order: exact CSS first, then role/label text, then placeholder text. Override any value here instead of editing the tool.",
+
+  "app_url": "https://flow.google.com/",
+  "home_url": "https://flow.google.com/about",
+
+  "prompt": {
+    "css": [
+      "textarea[placeholder*='prompt' i]",
+      "textarea[placeholder*='describe' i]",
+      "textarea",
+      "[contenteditable='true']"
+    ],
+    "role_textbox_names": ["prompt", "describe", "text", "describe a scene"],
+    "placeholder_regex": "prompt|describe|scene"
+  },
+
+  "generate_button": {
+    "css": [
+      "button[aria-label*='Generate' i]",
+      "button:has-text('Generate')"
+    ],
+    "role_button_names": ["generate", "generate video", "create"],
+    "text_regex": "^generate$|generate video|^create$"
+  },
+
+  "reference_upload": {
+    "css": [
+      "input[type='file']",
+      "[aria-label*='add image' i]",
+      "[aria-label*='upload' i]",
+      "[aria-label*='ingredient' i]",
+      "[aria-label*='frame' i]"
+    ],
+    "role_names": ["add image", "upload", "ingredients", "add frame", "reference"]
+  },
+
+  "download_button": {
+    "css": [
+      "a[download]",
+      "button[aria-label*='download' i]",
+      "button:has-text('Download')"
+    ],
+    "role_button_names": ["download", "download video", "save"],
+    "text_regex": "download"
+  },
+
+  "video_ready": {
+    "css": [
+      "video",
+      "[data-testid*='video' i]"
+    ],
+    "wait_for_video_element": true
+  },
+
+  "signed_out_markers": [
+    "sign in",
+    "log in",
+    "continue with google"
+  ],
+
+  "signed_in_markers": [
+    "new scene",
+    "create scene",
+    "assets panel",
+    "ingredients"
+  ],
+
+  "enter_app": {
+    "css": [],
+    "role_button_names": [
+      "Create with Google Flow",
+      "Try in Google Flow",
+      "Open Flow",
+      "Launch"
+    ],
+    "role_link_names": [
+      "Create with Google Flow",
+      "Try in Google Flow",
+      "Open Flow"
+    ],
+    "text_regex": "create with google flow|try in google flow|open flow"
+  }
+}

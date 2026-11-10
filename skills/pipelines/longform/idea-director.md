@@ -37,12 +37,14 @@ short clips and the bill follows **generated seconds, not runtime**:
 | Provider | Clip | Cost | Needs |
 |---|---|---|---|
 | `veo` | 8s at 1080p (Veo 3.1) | ~$0.40 / generated second → ~$3.20 per 8s clip | Google key (`GOOGLE_API_KEY` / Vertex credentials) |
+| `flow` | 8s from the Google Flow web surface | $0 — uses the user's Flow subscription | a signed-in Chrome profile (one-time `flow_browser` login) |
 | `still` | one ComfyUI image per shot + Ken Burns move | free, local | ComfyUI running on 8188 |
 | `mock` | flat colour clip | free | nothing |
 
 Work out the number of shots (narration duration ÷ ~7s) and multiply it out.
-A 60-second narration is ~9 shots: about **$29 with Veo**, **$0 with the local
-provider**. State the number and the provider before anything is generated.
+A 60-second narration is ~9 shots: about **$29 with Veo**, **$0 with the Flow
+subscription or the local provider**. State the number and the provider before
+anything is generated.
 
 ### 3. Name the composition runtime
 
